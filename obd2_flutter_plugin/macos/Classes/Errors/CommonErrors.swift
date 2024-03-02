@@ -15,6 +15,12 @@ class CommandExecutionError : Error { }
 
 class CantConnectError : Error { }
 
+enum ConnectionErrors: Error {
+    case cantConnectError
+    case deviceNotFoundError
+    case deviceDisconnectedError
+}
+
 enum ResolverErrors: Error {
     case invalidBufferContent
     case invalidResponse
@@ -28,5 +34,5 @@ enum CommonErrors: Error {
 
 enum CommandErrors: Error {
     case cantConnectError
-    case commandExecutionError
+    case commandExecutionError(String)
 }
