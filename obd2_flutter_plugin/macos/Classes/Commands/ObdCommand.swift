@@ -7,48 +7,48 @@
 import Foundation
 import CoreBluetooth
 
-open class ObdCommand {
+open class ObdCommand : BaseObdCommand {
     
     internal let logger: Logger
-
+    
     public let cmd : String
     internal var response : String?
     internal var buffer : [Int] = []
     public var useImperialUnits : Bool
-    public var responseDelayInMs : Int
+    internal var responseDelayInMs : Int
     
     internal var timeStart : Int64
     internal var timeEnd : Int64
     
-    private let MAX_RESPONSE_DELAY = 250
-
-    public init(_ command: String) {
+    public init(cmd command: String, delay responseDelay: Int) {
         self.buffer = []
         self.cmd = command
         self.response = nil
         self.timeStart = -1
         self.timeEnd = -1
-        self.responseDelayInMs = 0
         self.useImperialUnits = true
-        self.logger = Logger("ObdCmd::\(command)")
+        self.responseDelayInMs = min(responseDelay, 250)
+        self.logger = Logger("ObdCmd[\(command)]")
     }
-
+    
     /** Executes the holding command and return its response if expecting.
-    *!  CAUTION: This method doesn't check for channels or adapter connection
-    *!  so, when calling it, you must ensure that adapter is connected and channel was discovered and open
-    */
-    func execute(bleManager: BluetoothManager, expectResponse: Bool) async -> String? {
-        do {    
+     *!  CAUTION: This method doesn't check for channels or adapter connection
+     *!  so, when calling it, you must ensure that adapter is connected and channel was discovered and open
+     */
+    func execute(bleManager: BluetoothManager, expectResponse: Bool) async throws -> String? {
+        do {
             // Time the start of execution
             self.timeStart = TimeHelper.currentTimeInMillis()
             // Send the command to peripheral by calling sendCommand
             try await self.sendCommand(bm: bleManager)
-            // Hold thread for a delay if presented
-            if self.responseDelayInMs > 0 {
-                try await Task.sleep(nanoseconds: UInt64(self.responseDelayInMs * 1_000_000))
-            }
             var response: String? = nil
             if expectResponse {
+                // Hold thread for a delay if presented
+                if self.responseDelayInMs > 0 {
+                    logger.log("execute", "Waiting \(self.responseDelayInMs) millis for the response...")
+                    try await Task.sleep(nanoseconds: UInt64(self.responseDelayInMs * 1_000_000))
+                    logger.log("execute", "Finished waiting.. Looking for response in response station...")
+                }
                 // Read the result by calling readResult
                 response = try await self.readResult(bm: bleManager)
                 self.response = response
@@ -56,19 +56,19 @@ open class ObdCommand {
             // Time the end of execution
             self.timeEnd = TimeHelper.currentTimeInMillis()
             // log
-            logger.log("Executed: cmd='\(self.cmd)', res='\(self.getFormattedResult())' took= \(self.timeEnd - self.timeStart) ms")
+            logger.log("execute", "Executed: cmd='\(self.cmd)', response='\(self.getFormattedResult())' took= \(self.timeEnd - self.timeStart) ms")
             return response
         } catch {
-            logger.log("Error while executing command or while resolving response. Reason: \(error)")
-            return nil
+            logger.log("execute", "Error while executing command or while resolving response. Reason: \(error)")
+            throw error
         }
     }
-
+    
     /**
      * Sends the OBD-II request.
      */
     private func sendCommand(bm bleManager: BluetoothManager) async throws {
-        logger.log("Sending command: \(self.cmd)")
+        logger.log("sendCommand", "Sending command: \(self.cmd)")
         let readyCmd = self.cmd + "\r"
         try await bleManager.send(dataToSend: readyCmd)
     }
@@ -87,17 +87,18 @@ open class ObdCommand {
     private func readRawBytes(bm bleManager: BluetoothManager) async throws {
         //* Consume the very first packet on ResponseStation instance
         let packet = bleManager.consumeNextResponse()
-        var rawResponse = packet.decodePayload()
-        guard !rawResponse.isEmpty else {
+        let rawResponse = packet.decodePayload()
+        guard rawResponse.isNotEmpty() else {
             throw ResolverErrors.emptyResponse
         }
-        self.logger.log("readRawBytes", "Raw response: '\(rawResponse)'")
-        // Remove Searching from response
-        rawResponse = RegexMatcher.replaceInString(pattern: RegexPatterns.SEARCHING_PATTERN, original: rawResponse, replacement: "")
-        // Remove whitespaces, invalid chars and escape letters from response
-        rawResponse = RegexMatcher.replaceInString(pattern: RegexPatterns.WHITESPACE_PATTERN, original: rawResponse, replacement: "")
-        
-        self.response = rawResponse
+        self.logger.log("readRawBytes", "Uncleaned raw response: '\(rawResponse.removeWhitespaces())'")
+        // Clean the response from unnecessary stuff
+        self.response = ResponseCleaner.on(src: rawResponse)
+            .clean(pattern: RegexPatterns.SEARCHING_PATTERN)
+            .clean(pattern: RegexPatterns.BUSINIT_PATTERN)
+            .clean(pattern: RegexPatterns.WHITESPACE_PATTERN)
+            .clean(pattern: RegexPatterns.BUSINIT_PATTERN)
+            .getResult()
         self.logger.log("readRawBytes", "Ready raw response: '\(self.response ?? "")'")
     }
     
@@ -120,7 +121,7 @@ open class ObdCommand {
         for error in errors {
             error.setCommand(command: self.cmd)
             if error.check(response: self.response ?? "") {
-                self.logger.log("checkForErrors", "Checker found \(type(of: error)) match in response")
+                self.logger.log("checkForErrors", "Checker found \(type(of: error)) match in response. Message: \(error.message).")
                 throw error
             }
             self.logger.log("checkForErrors", "Passed '\(type(of: error))'")
@@ -133,16 +134,14 @@ open class ObdCommand {
     private func fillBuffer() async throws {
         //* Take a copy of response
         var response = self.response ?? ""
-        //* Remove all whitespaces and line breaks from response
-        response = RegexMatcher.replaceInString(pattern: RegexPatterns.WHITESPACE_PATTERN, original: response, replacement: "")
-        //* Remove BUS INIT from response
-        response = RegexMatcher.replaceInString(pattern: RegexPatterns.BUSINIT_PATTERN, original: response, replacement: "")
-        //* Check one more time if the response is nil or empty
-        guard !response.isEmpty else { 
-            throw ResolverErrors.emptyResponse
-        }
+        // Check if the response is not empty before proceeding
+        guard response.isNotEmpty() else { throw ResolverErrors.emptyResponse }
+        //* Clean response from special characters
+        response = response.removeWhitespaces()
+        //* Check one more time if the response is empty
+        guard response.isNotEmpty() else { throw ResolverErrors.emptyResponse }
         //* Check whether response has numeric output
-        guard RegexMatcher.isMatchingRegex(inputString: response, regexPattern: RegexPatterns.DIGITS_LETTERS_PATTERN) else {
+        guard ResponseValidator.matchesDigitsLettersPattern(res: response) else {
             self.logger.log("fillBuffer", "Response is either invalid or contains non numeric values.")
             throw ResolverErrors.invalidResponse
         }
@@ -152,7 +151,7 @@ open class ObdCommand {
             throw ResolverErrors.invalidResponse
         }
         var size = rawBytes.count
-        //* Check if rawBytes has at least two bytes within  
+        //* Check if rawBytes has at least two bytes within
         if size <= 1 {
             throw ResolverErrors.invalidResponse
         }
@@ -175,26 +174,15 @@ open class ObdCommand {
         }
     }
     
-    /**
-     * This method exists so that for each command, there must be a method that is
-     * called only once to perform calculations.
-     */
     func performCalculations() async throws {
-        logger.log("This method should be overridden.")
     }
     
-    public func getFormattedResult() -> String {
-        logger.log("This method should be overridden.")
-        return "NO DATA"
+    func getFormattedResult() -> String {
+        return ""
     }
-
-    public func getResult() -> String? {
-        return self.response
+    
+    func getResultUnit() -> String {
+        return ""
     }
-
-    public func getResultUnit() -> String {
-        logger.log("This method should be overridden.")
-        return "?"
-    }
-
+    
 }

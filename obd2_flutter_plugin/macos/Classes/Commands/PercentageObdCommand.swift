@@ -10,11 +10,7 @@ import Foundation
 open class PercentageObdCommand : ObdCommand {
     
     var percentage: Double = 0.0
-
-    public override init(_ command: String) {
-        super.init(command)
-    }
-
+    
     override func performCalculations() async throws {
         self.logger.log("performCalculations", "Bytes available in buffer[\(self.buffer)]")
         // ignore first two bytes [hh hh] of the response
@@ -23,18 +19,19 @@ open class PercentageObdCommand : ObdCommand {
         } else {
             throw ResolverErrors.invalidBufferContent
         }
+        self.logger.log("performCalculations", "Calculated result: \(self.getFormattedResult())")
     }
-
+    
     public override func getFormattedResult() -> String {
-        return "\(String(format: "%.1f", self.percentage))\(self.getResultUnit())"
+        return "\(String(format: "%.1f", self.getPercentage()))\(self.getResultUnit())"
     }
-
+    
     public override func getResultUnit() -> String {
         return "%"
     }
-
+    
     public func getPercentage() -> Double {
         return self.percentage
     }
-
+    
 }
