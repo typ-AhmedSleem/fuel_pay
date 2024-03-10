@@ -14,17 +14,45 @@ public class Obd2FlutterPlugin: NSObject, FlutterPlugin {
         registrar.addMethodCallDelegate(instance, channel: fuelChannel)
     }
     
-    private func connect(_ address: String, callback: @escaping (Result<Bool, CantConnectError>) -> Void) {
+    private func performBluetoothScan(callback: @escaping (Result<[String], Error>) -> Void) {
         Task {
-            let connected = await self.obd2.connect(target: address)
-            callback(.success(connected))
+            do {
+                try await self.obd2.bluetoothManager.scanForDevices()
+                let devices = obd2.bluetoothManager.retrieveBoundedBluetoothDevicesSerialized()
+                if devices.isEmpty {
+                    logger.log("No bounded devices was found.")
+                } else {
+                    logger.log("Retrieved \(devices.count) bluetooth device.")
+                }
+                callback(.success(devices))
+            } catch {
+                callback(.failure(error))
+            }
+        }
+    }
+    
+    private func connect(_ address: String, callback: @escaping (Result<Bool, Error>) -> Void) {
+        Task {
+            do {
+                let connected = try await self.obd2.connect(target: address)
+                callback(.success(connected))
+            } catch {
+                callback(.failure(ConnectionErrors.cantConnectError))
+            }
         }
     }
     
     private func initializeOBD(callback: @escaping (Result<Bool, Error>) -> Void) {
         Task {
-            await self.obd2.initializeOBD()
-            callback(.success(true))
+            do {
+                if try await self.obd2.initializeOBD() {
+                    callback(.success(true))
+                } else {
+                    callback(.failure(CommandErrors.commandExecutionError("Error initializing OBD adapter.")))
+                }
+            } catch {
+                callback(.failure(error))
+            }
         }
     }
     
@@ -40,18 +68,18 @@ public class Obd2FlutterPlugin: NSObject, FlutterPlugin {
     }
     
     public func handle(_ call: FlutterMethodCall, result: @escaping FlutterResult) {
-        logger.log("[PLUGIN]: Got call=\(call.method) | args=\(String(describing: call.arguments))")
+        //        logger.log("[PLUGIN]: Got call=\(call.method) | args=\(String(describing: call.arguments))")
         switch call.method {
         case MethodsNames.SCAN_BLUETOOTH_DEVICES:
-            if self.obd2.isBLEManagerInitialized {
-                let devices: [String] = obd2.bluetoothManager?.retrieveBoundedBluetoothDevicesSerialized() ?? []
-                if devices.isEmpty {
-                    logger.log("No bounded devices found. Scanning for devices...")
-                    self.obd2.bluetoothManager?.scanForDevices()
-                } else {
-                    logger.log("Retrieved \(devices.count) bluetooth device.")
+            if self.obd2.bluetoothManager.isPowredOn {
+                self.performBluetoothScan() { res in
+                    switch res {
+                    case .success(let devices):
+                        result(devices)  
+                    case .failure(let error):
+                        result(error.localizedDescription)
+                    }
                 }
-                result(devices)
             } else {
                 logger.log("Bluetooth isn't initialized")
                 //* If we reached this point, it means that BLE manager hasn't yet been initialized. So, result an error
@@ -69,6 +97,7 @@ public class Obd2FlutterPlugin: NSObject, FlutterPlugin {
                 self.connect(address) { res in
                     switch res {
                     case .success(let connected):
+                        self.logger.log("Connection to adapter result is \(connected)")
                         result(connected)
                     case .failure(let error):
                         self.logger.log(String(describing: error))
